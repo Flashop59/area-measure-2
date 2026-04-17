@@ -116,30 +116,33 @@ def remove_duplicate_points(df):
     return df
 
 
-def remove_speed_outliers(df, max_speed_kmph=15.0):
+def remove_far_jump_points(df, max_jump_m=20.0):
+    """
+    Remove points that jump too far from the previous kept point.
+    Rule:
+    - first point is kept
+    - if current point is more than max_jump_m away from previous kept point,
+      current point is removed
+    """
     df = df.copy().sort_values("Timestamp").reset_index(drop=True)
 
-    if len(df) < 3:
+    if len(df) <= 1:
         return df
 
-    keep = np.ones(len(df), dtype=bool)
+    keep_indices = [0]
+    last_kept_idx = 0
 
     for i in range(1, len(df)):
-        dt = (df.loc[i, "Timestamp"] - df.loc[i - 1, "Timestamp"]).total_seconds()
-        if dt <= 0:
-            keep[i] = False
-            continue
-
         dist_m = haversine_m(
-            df.loc[i - 1, "lat"], df.loc[i - 1, "lng"],
+            df.loc[last_kept_idx, "lat"], df.loc[last_kept_idx, "lng"],
             df.loc[i, "lat"], df.loc[i, "lng"]
         )
-        speed_kmph = (dist_m / dt) * 3.6
 
-        if speed_kmph > max_speed_kmph:
-            keep[i] = False
+        if dist_m <= max_jump_m:
+            keep_indices.append(i)
+            last_kept_idx = i
 
-    return df[keep].reset_index(drop=True)
+    return df.loc[keep_indices].reset_index(drop=True)
 
 
 # =========================================================
@@ -153,7 +156,6 @@ def count_neighbors_within_radius(xy, radius_m):
     nn.fit(xy)
     neighbors = nn.radius_neighbors(xy, return_distance=False)
 
-    # exclude self
     counts = np.array([max(len(n) - 1, 0) for n in neighbors], dtype=int)
     return counts
 
@@ -175,10 +177,6 @@ def label_operation_by_density(df, radius_m=8.0, min_neighbors=8):
 
 
 def make_segments_from_labels(labels):
-    """
-    labels: list/array of strings
-    returns list of dict segments with start_idx, end_idx, label
-    """
     if len(labels) == 0:
         return []
 
@@ -223,12 +221,6 @@ def smooth_point_types(
     min_movement_run_points=5,
     min_movement_break_distance_m=20.0
 ):
-    """
-    1) tiny operation runs => movement
-    2) tiny movement runs => operation
-    3) if movement segment between two operation segments is short in distance,
-       merge back into operation
-    """
     df = df.copy()
     labels = df["raw_point_type"].tolist()
 
@@ -237,7 +229,6 @@ def smooth_point_types(
         changed = False
         segments = make_segments_from_labels(labels)
 
-        # small run suppression
         for seg in segments:
             seg_len = seg["end_idx"] - seg["start_idx"] + 1
 
@@ -254,7 +245,6 @@ def smooth_point_types(
         if changed:
             continue
 
-        # merge short movement breaks between operation runs
         segments = make_segments_from_labels(labels)
         for j in range(1, len(segments) - 1):
             prev_seg = segments[j - 1]
@@ -278,9 +268,6 @@ def smooth_point_types(
 
 
 def assign_field_ids(df, min_operation_segment_points=20):
-    """
-    Every continuous operation run becomes one field cluster.
-    """
     df = df.copy()
     df["field_id"] = np.nan
 
@@ -357,7 +344,6 @@ def compute_summary(df, working_width_m):
 
     summary = pd.DataFrame(rows).sort_values("Start Date").reset_index(drop=True)
 
-    # movement gap stats to next field
     movement_rows = []
     for i in range(len(summary)):
         if i == len(summary) - 1:
@@ -370,10 +356,6 @@ def compute_summary(df, working_width_m):
         g_now = op[op["field_id"] == fid_now].sort_values("Timestamp").reset_index(drop=True)
         g_next = op[op["field_id"] == fid_next].sort_values("Timestamp").reset_index(drop=True)
 
-        idx1 = g_now.index[-1]
-        idx2 = g_next.index[0]
-
-        # straight gap between end and next start
         d = haversine_m(
             g_now.loc[len(g_now) - 1, "lat"], g_now.loc[len(g_now) - 1, "lng"],
             g_next.loc[0, "lat"], g_next.loc[0, "lng"]
@@ -507,11 +489,11 @@ def process_pipeline(
     min_movement_run_points,
     min_movement_break_distance_m,
     min_operation_segment_points,
-    max_speed_kmph
+    max_jump_m
 ):
     df, meta = normalize_columns(raw_df)
     df = remove_duplicate_points(df)
-    df = remove_speed_outliers(df, max_speed_kmph=max_speed_kmph)
+    df = remove_far_jump_points(df, max_jump_m=max_jump_m)
 
     if df.empty:
         raise ValueError("No valid data left after cleaning.")
@@ -565,8 +547,14 @@ with st.sidebar:
     min_movement_break_distance_m = st.number_input("Min movement distance to split fields (m)", min_value=1.0, max_value=1000.0, value=20.0, step=1.0)
     min_operation_segment_points = st.number_input("Min final field points", min_value=1, max_value=5000, value=20, step=1)
 
-    st.header("Cleaning")
-    max_speed_kmph = st.number_input("Max allowed speed (kmph)", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
+    st.header("Jump Outlier Removal")
+    max_jump_m = st.number_input(
+        "Remove point if jump from previous kept point is more than (m)",
+        min_value=1.0,
+        max_value=200.0,
+        value=20.0,
+        step=1.0
+    )
 
     st.header("Map Overlays")
     show_raw_track = st.checkbox("Show raw track", value=True)
@@ -590,7 +578,7 @@ if uploaded_file:
             min_movement_run_points=int(min_movement_run_points),
             min_movement_break_distance_m=min_movement_break_distance_m,
             min_operation_segment_points=int(min_operation_segment_points),
-            max_speed_kmph=max_speed_kmph
+            max_jump_m=max_jump_m
         )
 
         c1, c2, c3, c4 = st.columns(4)
