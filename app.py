@@ -19,12 +19,8 @@ MAPBOX_TOKEN = "pk.eyJ1IjoiZmxhc2hvcDAwNyIsImEiOiJjbW44a2s5MzcwYm5vMnFzZGloMGpod
 # Helpers
 # ---------------------------
 def latlon_to_local_xy(points):
-    """
-    Convert lat/lng points to local X/Y meters using equirectangular approximation.
-    Good enough for field-size area calculations.
-    points: Nx2 array -> [lat, lng]
-    """
     points = np.asarray(points, dtype=float)
+
     if len(points) == 0:
         return np.empty((0, 2))
 
@@ -41,9 +37,6 @@ def latlon_to_local_xy(points):
 
 
 def calculate_convex_hull_area_m2(points):
-    """
-    Calculate convex hull area in square meters from lat/lng points.
-    """
     points = np.asarray(points, dtype=float)
 
     if len(points) < 3:
@@ -51,9 +44,8 @@ def calculate_convex_hull_area_m2(points):
 
     try:
         xy = latlon_to_local_xy(points)
-
-        # ConvexHull needs unique points
         xy_unique = np.unique(xy, axis=0)
+
         if len(xy_unique) < 3:
             return 0.0
 
@@ -62,41 +54,40 @@ def calculate_convex_hull_area_m2(points):
         poly = Polygon(hull_points)
 
         return float(poly.area)
-    except Exception:
+    except:
         return 0.0
 
 
 def calculate_centroid(points):
     points = np.asarray(points, dtype=float)
+
     if len(points) == 0:
         return np.array([np.nan, np.nan])
+
     return np.mean(points, axis=0)
 
 
+# ---------------------------
+# Core Processing
+# ---------------------------
 def process_data(gps_data):
-    """
-    gps_data must contain:
-    lat, lng, Timestamp
-    """
     gps_data = gps_data.copy()
-
     gps_data = gps_data.dropna(subset=["lat", "lng", "Timestamp"])
     gps_data = gps_data.sort_values("Timestamp").reset_index(drop=True)
 
     if gps_data.empty:
-        raise ValueError("No valid GPS data found after cleaning.")
+        raise ValueError("No valid GPS data found.")
 
     coords = gps_data[["lat", "lng"]].values
 
-    # DBSCAN on raw lat/lng degrees
-    # eps=0.00008 ~ around 8-10 meters depending on latitude
-    db = DBSCAN(eps=0.00008, min_samples=11).fit(coords)
+    # DBSCAN clustering
+    db = DBSCAN(eps=0.00008, min_samples=10).fit(coords)
     gps_data["field_id"] = db.labels_
 
     fields = gps_data[gps_data["field_id"] != -1].copy()
 
     if fields.empty:
-        raise ValueError("No valid field clusters detected.")
+        raise ValueError("No field clusters detected.")
 
     # Area
     field_areas_m2 = fields.groupby("field_id").apply(
@@ -106,26 +97,25 @@ def process_data(gps_data):
 
     # Time
     field_times = fields.groupby("field_id").apply(
-        lambda df: (df["Timestamp"].max() - df["Timestamp"].min()).total_seconds() / 60.0
+        lambda df: (df["Timestamp"].max() - df["Timestamp"].min()).total_seconds() / 60
     )
 
-    # Start/end dates
+    # Dates
     field_dates = fields.groupby("field_id").agg(
         start_date=("Timestamp", "min"),
         end_date=("Timestamp", "max")
     )
 
-    # Keep only fields >= 5 gunthas
+    # Filter small fields
     valid_fields = field_areas_gunthas[field_areas_gunthas >= 5].index
 
     if len(valid_fields) == 0:
-        raise ValueError("No fields above 5 gunthas found.")
+        raise ValueError("No fields above 5 gunthas.")
 
     field_areas_gunthas = field_areas_gunthas.loc[valid_fields]
     field_times = field_times.loc[valid_fields]
     field_dates = field_dates.loc[valid_fields]
 
-    # Sort fields by actual visit order
     ordered_field_ids = field_dates.sort_values("start_date").index.tolist()
 
     # Centroids
@@ -133,177 +123,137 @@ def process_data(gps_data):
         lambda df: calculate_centroid(df[["lat", "lng"]].values)
     )
 
-    # Travel data: one value per field, last field gets NaN
+    # Travel calc
     travel_distances = []
     travel_times = []
 
-    for i, field_id in enumerate(ordered_field_ids):
+    for i, fid in enumerate(ordered_field_ids):
         if i < len(ordered_field_ids) - 1:
-            next_field_id = ordered_field_ids[i + 1]
+            next_fid = ordered_field_ids[i + 1]
 
-            end_point = fields[fields["field_id"] == field_id][["lat", "lng"]].iloc[-1].values
-            start_point = fields[fields["field_id"] == next_field_id][["lat", "lng"]].iloc[0].values
+            end_pt = fields[fields["field_id"] == fid][["lat", "lng"]].iloc[-1]
+            start_pt = fields[fields["field_id"] == next_fid][["lat", "lng"]].iloc[0]
 
-            distance_km = geodesic(
-                (float(end_point[0]), float(end_point[1])),
-                (float(start_point[0]), float(start_point[1]))
+            dist = geodesic(
+                (end_pt["lat"], end_pt["lng"]),
+                (start_pt["lat"], start_pt["lng"])
             ).kilometers
 
-            time_min = (
-                field_dates.loc[next_field_id, "start_date"] -
-                field_dates.loc[field_id, "end_date"]
-            ).total_seconds() / 60.0
+            time_gap = (
+                field_dates.loc[next_fid, "start_date"] -
+                field_dates.loc[fid, "end_date"]
+            ).total_seconds() / 60
 
-            # prevent negative gaps due to overlap/noise
-            if time_min < 0:
-                time_min = 0.0
+            if time_gap < 0:
+                time_gap = 0
 
-            travel_distances.append(distance_km)
-            travel_times.append(time_min)
+            travel_distances.append(dist)
+            travel_times.append(time_gap)
         else:
             travel_distances.append(np.nan)
             travel_times.append(np.nan)
 
     combined_df = pd.DataFrame({
         "Field ID": ordered_field_ids,
-        "Area (Gunthas)": [field_areas_gunthas.loc[fid] for fid in ordered_field_ids],
-        "Time (Minutes)": [field_times.loc[fid] for fid in ordered_field_ids],
-        "Start Date": [field_dates.loc[fid, "start_date"] for fid in ordered_field_ids],
-        "End Date": [field_dates.loc[fid, "end_date"] for fid in ordered_field_ids],
-        "Travel Distance to Next Field (km)": travel_distances,
-        "Travel Time to Next Field (minutes)": travel_times
+        "Area (Gunthas)": [field_areas_gunthas.loc[f] for f in ordered_field_ids],
+        "Time (Minutes)": [field_times.loc[f] for f in ordered_field_ids],
+        "Start Date": [field_dates.loc[f, "start_date"] for f in ordered_field_ids],
+        "End Date": [field_dates.loc[f, "end_date"] for f in ordered_field_ids],
+        "Travel Distance (km)": travel_distances,
+        "Travel Time (min)": travel_times
     })
 
+    # Totals
     total_area = combined_df["Area (Gunthas)"].sum()
     total_time = combined_df["Time (Minutes)"].sum()
-    total_travel_distance = np.nansum(combined_df["Travel Distance to Next Field (km)"])
-    total_travel_time = np.nansum(combined_df["Travel Time to Next Field (minutes)"])
+    total_dist = np.nansum(combined_df["Travel Distance (km)"])
+    total_travel_time = np.nansum(combined_df["Travel Time (min)"])
 
     # Map
-    map_center = [gps_data["lat"].mean(), gps_data["lng"].mean()]
-    m = folium.Map(location=map_center, zoom_start=16, tiles=None)
+    center = [gps_data["lat"].mean(), gps_data["lng"].mean()]
+    m = folium.Map(location=center, zoom_start=16)
 
-    folium.TileLayer(
-        tiles=f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/tiles/256/{{z}}/{{x}}/{{y}}?access_token={MAPBOX_TOKEN}",
-        attr="Mapbox Satellite Imagery",
-        name="Satellite",
-        overlay=False,
-        control=True
-    ).add_to(m)
+    plugins.Fullscreen().add_to(m)
 
-    plugins.Fullscreen(position="topright").add_to(m)
-    folium.LayerControl().add_to(m)
-
-    valid_field_set = set(ordered_field_ids)
-
-    # Plot points
     for _, row in gps_data.iterrows():
-        color = "blue" if row["field_id"] in valid_field_set else "red"
+        color = "blue" if row["field_id"] in ordered_field_ids else "red"
         folium.CircleMarker(
             location=(row["lat"], row["lng"]),
             radius=2,
             color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.8
+            fill=True
         ).add_to(m)
 
-    # Plot centroid markers for valid fields
     for fid in ordered_field_ids:
-        centroid = centroids.loc[fid]
+        c = centroids.loc[fid]
         folium.Marker(
-            location=(float(centroid[0]), float(centroid[1])),
-            popup=f"Field {fid}<br>Area: {field_areas_gunthas.loc[fid]:.2f} gunthas",
-            tooltip=f"Field {fid}",
-            icon=folium.Icon(color="green", icon="info-sign")
+            location=(c[0], c[1]),
+            tooltip=f"Field {fid}"
         ).add_to(m)
 
-    return m, combined_df, total_area, total_time, total_travel_distance, total_travel_time
+    return m, combined_df, total_area, total_time, total_dist, total_travel_time
 
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="Field Area and Time Calculation", layout="wide")
+st.set_page_config(page_title="Field Area Calculator", layout="wide")
 
-st.title("Field Area and Time Calculation from GPS CSV")
+st.title("Field Area from GPS Excel")
 
-st.write(
-    "Upload your CSV file containing GPS points. "
-    "The file should have an 'Ignition' column with values in 'lat,lon' format, "
-    "and preferably a timestamp column."
-)
+uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-
-if uploaded_file is not None:
+if uploaded_file:
     try:
-        df = pd.read_csv(uploaded_file)
+        df = pd.read_excel(uploaded_file)
 
-        if "Ignition" not in df.columns:
-            st.error("CSV must contain an 'Ignition' column with 'lat,lon' values.")
+        # normalize column names
+        df.columns = df.columns.str.strip().str.lower()
+
+        if "lat" not in df.columns or "lng" not in df.columns:
+            st.error("Excel must contain 'lat' and 'lng'")
             st.stop()
 
-        # Split Ignition into lat/lon
-        split_cols = df["Ignition"].astype(str).str.split(",", expand=True)
-        if split_cols.shape[1] < 2:
-            st.error("Ignition column does not contain valid 'lat,lon' data.")
-            st.stop()
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lng"] = pd.to_numeric(df["lng"], errors="coerce")
 
-        df["lat"] = pd.to_numeric(split_cols[0].str.strip(), errors="coerce")
-        df["lng"] = pd.to_numeric(split_cols[1].str.strip(), errors="coerce")
-
-        # Detect timestamp column
-        possible_time_cols = [
-            "time", "Time", "timestamp", "Timestamp", "date", "Date", "datetime", "Datetime"
-        ]
-
+        # timestamp detection
         time_col = None
-        for col in possible_time_cols:
+        for col in ["timestamp", "time", "date", "datetime"]:
             if col in df.columns:
                 time_col = col
                 break
 
-        if time_col is not None:
+        if time_col:
             df["Timestamp"] = pd.to_datetime(df[time_col], errors="coerce")
         else:
-            # fallback: use row order as pseudo-time
             df["Timestamp"] = pd.date_range(
-                start=pd.Timestamp.now().floor("s"),
+                start=pd.Timestamp.now(),
                 periods=len(df),
                 freq="s"
             )
 
-        df = df.dropna(subset=["lat", "lng", "Timestamp"]).reset_index(drop=True)
+        df = df.dropna(subset=["lat", "lng", "Timestamp"])
 
-        if df.empty:
-            st.error("No valid rows found after parsing lat, lon, and timestamp.")
-            st.stop()
+        map_obj, table, ta, tt, td, ttt = process_data(df)
 
-        map_obj, combined_df, total_area, total_time, total_travel_distance, total_travel_time = process_data(
-            df[["lat", "lng", "Timestamp"]]
-        )
+        st.subheader("Map")
+        folium_static(map_obj, width=1400, height=600)
 
-        st.subheader("Field Map")
-        folium_static(map_obj, width=1400, height=700)
+        st.subheader("Data")
+        st.dataframe(table)
 
-        st.subheader("Field Area and Time Data")
-        st.dataframe(combined_df, use_container_width=True)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Area", f"{ta:.2f} Gunthas")
+        c2.metric("Total Time", f"{tt:.2f} min")
+        c3.metric("Travel Distance", f"{td:.2f} km")
+        c4.metric("Travel Time", f"{ttt:.2f} min")
 
-        st.subheader("Total Metrics")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Area", f"{total_area:.2f} Gunthas")
-        col2.metric("Total Time", f"{total_time:.2f} Minutes")
-        col3.metric("Total Travel Distance", f"{total_travel_distance:.2f} km")
-        col4.metric("Total Travel Time", f"{total_travel_time:.2f} Minutes")
-
-        csv = combined_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download CSV",
-            data=csv,
-            file_name="field_data.csv",
-            mime="text/csv"
+            table.to_csv(index=False),
+            "output.csv"
         )
 
     except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.error(f"Error: {e}")
