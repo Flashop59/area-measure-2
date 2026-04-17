@@ -3,25 +3,21 @@ import pandas as pd
 import numpy as np
 import folium
 
-from math import cos, radians, sin, asin, sqrt
-from shapely.geometry import LineString, Point, mapping
-from shapely.ops import unary_union
-from sklearn.cluster import DBSCAN
+from math import radians, cos, sin, asin, sqrt
+from sklearn.neighbors import NearestNeighbors
 from streamlit_folium import folium_static
 from folium import plugins
 
 # =========================================================
-# CONFIG
+# CONSTANTS
 # =========================================================
 GUNTHA_M2 = 101.17
+FT_TO_M = 0.3048
 
 # =========================================================
-# HELPERS
+# GEO HELPERS
 # =========================================================
 def haversine_m(lat1, lon1, lat2, lon2):
-    """
-    Great-circle distance between two GPS points in meters.
-    """
     r = 6371000.0
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
@@ -34,10 +30,6 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
 
 def latlon_to_local_xy(points, lat0=None, lon0=None):
-    """
-    Convert lat/lon to local XY meters using equirectangular approximation.
-    points: Nx2 array [[lat, lon], ...]
-    """
     points = np.asarray(points, dtype=float)
 
     if len(points) == 0:
@@ -57,23 +49,22 @@ def latlon_to_local_xy(points, lat0=None, lon0=None):
     return np.column_stack((x, y)), lat0, lon0
 
 
-def local_xy_to_latlon(x, y, lat0, lon0):
-    """
-    Convert local XY meters back to lat/lon.
-    """
-    meters_per_deg_lat = 111320.0
-    meters_per_deg_lon = 111320.0 * cos(radians(lat0))
-
-    lat = lat0 + (y / meters_per_deg_lat)
-    lon = lon0 + (x / meters_per_deg_lon)
-    return lat, lon
+# =========================================================
+# INPUT / CLEANING
+# =========================================================
+def load_input_file(uploaded_file):
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    elif name.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("Unsupported file. Upload CSV or XLSX.")
 
 
 def normalize_columns(df):
-    """
-    Auto-detect lat/lon/time columns.
-    """
     df = df.copy()
+    original_cols = list(df.columns)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     lat_candidates = ["lat", "latitude"]
@@ -85,9 +76,7 @@ def normalize_columns(df):
     time_col = next((c for c in time_candidates if c in df.columns), None)
 
     if lat_col is None or lon_col is None:
-        raise ValueError(
-            "Could not detect latitude/longitude columns. Use lat/lng or latitude/longitude."
-        )
+        raise ValueError("Could not detect lat/lng columns. Use lat/lng or latitude/longitude.")
 
     out = pd.DataFrame()
     out["lat"] = pd.to_numeric(df[lat_col], errors="coerce")
@@ -104,495 +93,570 @@ def normalize_columns(df):
             freq="s"
         )
 
-    out = out.dropna(subset=["lat", "lng", "Timestamp"]).reset_index(drop=True)
-    return out, synthetic_time, lat_col, lon_col, time_col
-
-
-def remove_basic_gps_noise(df):
-    """
-    Remove impossible coordinates and duplicates.
-    """
-    df = df.copy()
-    df = df[
-        (df["lat"].between(-90, 90)) &
-        (df["lng"].between(-180, 180))
+    out = out.dropna(subset=["lat", "lng", "Timestamp"]).copy()
+    out = out[
+        out["lat"].between(-90, 90) &
+        out["lng"].between(-180, 180)
     ].copy()
 
-    df = df.drop_duplicates(subset=["lat", "lng", "Timestamp"])
-    df = df.sort_values("Timestamp").reset_index(drop=True)
+    out = out.sort_values("Timestamp").reset_index(drop=True)
+
+    return out, {
+        "original_columns": original_cols,
+        "lat_col": lat_col,
+        "lon_col": lon_col,
+        "time_col": time_col,
+        "synthetic_time": synthetic_time
+    }
+
+
+def remove_duplicate_points(df):
+    df = df.copy()
+    df = df.drop_duplicates(subset=["lat", "lng", "Timestamp"]).reset_index(drop=True)
     return df
 
 
 def remove_speed_outliers(df, max_speed_kmph=15.0):
-    """
-    Remove points that imply impossible speed jumps.
-    For farm machine use, default 15 kmph is already generous.
-    """
     df = df.copy().sort_values("Timestamp").reset_index(drop=True)
 
     if len(df) < 3:
         return df
 
-    keep = [True]
+    keep = np.ones(len(df), dtype=bool)
 
     for i in range(1, len(df)):
-        prev = df.iloc[i - 1]
-        curr = df.iloc[i]
-
-        dt = (curr["Timestamp"] - prev["Timestamp"]).total_seconds()
+        dt = (df.loc[i, "Timestamp"] - df.loc[i - 1, "Timestamp"]).total_seconds()
         if dt <= 0:
-            keep.append(False)
+            keep[i] = False
             continue
 
-        dist_m = haversine_m(prev["lat"], prev["lng"], curr["lat"], curr["lng"])
+        dist_m = haversine_m(
+            df.loc[i - 1, "lat"], df.loc[i - 1, "lng"],
+            df.loc[i, "lat"], df.loc[i, "lng"]
+        )
         speed_kmph = (dist_m / dt) * 3.6
 
-        keep.append(speed_kmph <= max_speed_kmph)
+        if speed_kmph > max_speed_kmph:
+            keep[i] = False
 
-    df = df[np.array(keep, dtype=bool)].reset_index(drop=True)
+    return df[keep].reset_index(drop=True)
+
+
+# =========================================================
+# LABELING: MOVEMENT VS OPERATION
+# =========================================================
+def count_neighbors_within_radius(xy, radius_m):
+    if len(xy) == 0:
+        return np.array([], dtype=int)
+
+    nn = NearestNeighbors(radius=radius_m, metric="euclidean")
+    nn.fit(xy)
+    neighbors = nn.radius_neighbors(xy, return_distance=False)
+
+    # exclude self
+    counts = np.array([max(len(n) - 1, 0) for n in neighbors], dtype=int)
+    return counts
+
+
+def label_operation_by_density(df, radius_m=8.0, min_neighbors=8):
+    df = df.copy()
+    xy, _, _ = latlon_to_local_xy(df[["lat", "lng"]].to_numpy())
+
+    neighbor_count = count_neighbors_within_radius(xy, radius_m=radius_m)
+    df["neighbor_count"] = neighbor_count
+
+    df["raw_point_type"] = np.where(
+        df["neighbor_count"] >= min_neighbors,
+        "operation",
+        "movement"
+    )
+
     return df
 
 
-def assign_sessions(df, time_gap_minutes=10):
+def make_segments_from_labels(labels):
     """
-    Split data into sessions when time gap is large.
+    labels: list/array of strings
+    returns list of dict segments with start_idx, end_idx, label
     """
-    df = df.copy().sort_values("Timestamp").reset_index(drop=True)
+    if len(labels) == 0:
+        return []
 
-    gaps = df["Timestamp"].diff().dt.total_seconds().fillna(0)
-    new_session = (gaps > time_gap_minutes * 60).astype(int)
-    df["session_id"] = new_session.cumsum()
-    return df
+    segments = []
+    start = 0
+    current = labels[0]
+
+    for i in range(1, len(labels)):
+        if labels[i] != current:
+            segments.append({
+                "start_idx": start,
+                "end_idx": i - 1,
+                "label": current
+            })
+            start = i
+            current = labels[i]
+
+    segments.append({
+        "start_idx": start,
+        "end_idx": len(labels) - 1,
+        "label": current
+    })
+    return segments
 
 
-def cluster_fields(df, dbscan_eps_m=10.0, min_samples=8):
+def segment_point_distance(df, start_idx, end_idx):
+    if end_idx <= start_idx:
+        return 0.0
+
+    dist = 0.0
+    for i in range(start_idx + 1, end_idx + 1):
+        dist += haversine_m(
+            df.loc[i - 1, "lat"], df.loc[i - 1, "lng"],
+            df.loc[i, "lat"], df.loc[i, "lng"]
+        )
+    return dist
+
+
+def smooth_point_types(
+    df,
+    min_operation_run_points=15,
+    min_movement_run_points=5,
+    min_movement_break_distance_m=20.0
+):
     """
-    Cluster points inside each session using XY meters.
+    1) tiny operation runs => movement
+    2) tiny movement runs => operation
+    3) if movement segment between two operation segments is short in distance,
+       merge back into operation
     """
     df = df.copy()
-    df["field_id"] = -1
+    labels = df["raw_point_type"].tolist()
 
-    next_field_id = 0
+    changed = True
+    while changed:
+        changed = False
+        segments = make_segments_from_labels(labels)
 
-    for session_id, g in df.groupby("session_id", sort=True):
-        coords = g[["lat", "lng"]].to_numpy()
-        xy, _, _ = latlon_to_local_xy(coords)
+        # small run suppression
+        for seg in segments:
+            seg_len = seg["end_idx"] - seg["start_idx"] + 1
 
-        if len(xy) < min_samples:
+            if seg["label"] == "operation" and seg_len < min_operation_run_points:
+                for i in range(seg["start_idx"], seg["end_idx"] + 1):
+                    labels[i] = "movement"
+                changed = True
+
+            elif seg["label"] == "movement" and seg_len < min_movement_run_points:
+                for i in range(seg["start_idx"], seg["end_idx"] + 1):
+                    labels[i] = "operation"
+                changed = True
+
+        if changed:
             continue
 
-        labels = DBSCAN(eps=dbscan_eps_m, min_samples=min_samples).fit_predict(xy)
+        # merge short movement breaks between operation runs
+        segments = make_segments_from_labels(labels)
+        for j in range(1, len(segments) - 1):
+            prev_seg = segments[j - 1]
+            mid_seg = segments[j]
+            next_seg = segments[j + 1]
 
-        session_idx = g.index.to_list()
-        local_to_global = {}
+            if (
+                prev_seg["label"] == "operation"
+                and mid_seg["label"] == "movement"
+                and next_seg["label"] == "operation"
+            ):
+                move_dist = segment_point_distance(df, mid_seg["start_idx"], mid_seg["end_idx"])
+                if move_dist < min_movement_break_distance_m:
+                    for i in range(mid_seg["start_idx"], mid_seg["end_idx"] + 1):
+                        labels[i] = "operation"
+                    changed = True
+                    break
 
-        unique_labels = sorted(set(labels))
-        for lbl in unique_labels:
-            if lbl == -1:
-                continue
-            local_to_global[lbl] = next_field_id
-            next_field_id += 1
+    df["point_type"] = labels
+    return df
 
-        for row_i, lbl in zip(session_idx, labels):
-            if lbl != -1:
-                df.at[row_i, "field_id"] = local_to_global[lbl]
+
+def assign_field_ids(df, min_operation_segment_points=20):
+    """
+    Every continuous operation run becomes one field cluster.
+    """
+    df = df.copy()
+    df["field_id"] = np.nan
+
+    labels = df["point_type"].tolist()
+    segments = make_segments_from_labels(labels)
+
+    next_fid = 1
+    for seg in segments:
+        if seg["label"] != "operation":
+            continue
+
+        seg_len = seg["end_idx"] - seg["start_idx"] + 1
+        if seg_len < min_operation_segment_points:
+            continue
+
+        df.loc[seg["start_idx"]:seg["end_idx"], "field_id"] = next_fid
+        next_fid += 1
 
     return df
 
 
-def make_coverage_geometry_area(points_latlon, implement_width_m):
-    """
-    Estimate covered area by buffering the machine path with implement width.
-    This is much better than convex hull for field coverage.
-    """
-    pts = np.asarray(points_latlon, dtype=float)
+# =========================================================
+# FIELD METRICS
+# =========================================================
+def compute_operation_path_distance_m(g):
+    if len(g) < 2:
+        return 0.0
 
-    if len(pts) == 0:
-        return None, 0.0, np.nan, np.nan
+    dist = 0.0
+    g = g.sort_values("Timestamp").reset_index(drop=True)
 
-    xy, lat0, lon0 = latlon_to_local_xy(pts)
+    for i in range(1, len(g)):
+        dist += haversine_m(
+            g.loc[i - 1, "lat"], g.loc[i - 1, "lng"],
+            g.loc[i, "lat"], g.loc[i, "lng"]
+        )
 
-    # Remove repeated XY points
-    xy_unique_ordered = np.array(pd.DataFrame(xy).drop_duplicates().values, dtype=float)
-
-    if len(xy_unique_ordered) == 0:
-        return None, 0.0, lat0, lon0
-
-    radius = max(implement_width_m / 2.0, 0.05)
-
-    if len(xy_unique_ordered) == 1:
-        geom = Point(xy_unique_ordered[0]).buffer(radius, cap_style=1)
-    else:
-        line = LineString(xy_unique_ordered)
-        geom = line.buffer(radius, cap_style=1, join_style=1)
-
-    area_m2 = float(geom.area)
-    return geom, area_m2, lat0, lon0
+    return dist
 
 
-def representative_center(points_latlon):
-    """
-    Safe center marker point.
-    """
-    pts = np.asarray(points_latlon, dtype=float)
-    if len(pts) == 0:
-        return np.nan, np.nan
-    return float(np.median(pts[:, 0])), float(np.median(pts[:, 1]))
+def compute_summary(df, working_width_m):
+    op = df[df["field_id"].notna()].copy()
+    if op.empty:
+        return pd.DataFrame()
 
-
-def geom_to_folium_geojson(geom, lat0, lon0):
-    """
-    Convert local XY shapely geometry back into lat/lon GeoJSON for folium.
-    """
-    if geom is None or geom.is_empty:
-        return None
-
-    def convert_coords(coords):
-        converted = []
-        for x, y in coords:
-            lat, lon = local_xy_to_latlon(x, y, lat0, lon0)
-            converted.append((lon, lat))  # GeoJSON uses lon, lat
-        return converted
-
-    if geom.geom_type == "Polygon":
-        exterior = convert_coords(list(geom.exterior.coords))
-        interiors = [convert_coords(list(r.coords)) for r in geom.interiors]
-        return {
-            "type": "Polygon",
-            "coordinates": [exterior] + interiors
-        }
-
-    if geom.geom_type == "MultiPolygon":
-        polys = []
-        for poly in geom.geoms:
-            exterior = convert_coords(list(poly.exterior.coords))
-            interiors = [convert_coords(list(r.coords)) for r in poly.interiors]
-            polys.append([exterior] + interiors)
-        return {
-            "type": "MultiPolygon",
-            "coordinates": polys
-        }
-
-    return None
-
-
-def build_field_summary(df_fields, implement_width_m, min_field_gunthas):
-    """
-    Compute per-field metrics.
-    """
     rows = []
-    field_geom_info = {}
-
-    for field_id, g in df_fields.groupby("field_id", sort=True):
+    for fid, g in op.groupby("field_id", sort=True):
         g = g.sort_values("Timestamp").reset_index(drop=True)
-        pts = g[["lat", "lng"]].to_numpy()
 
-        geom, area_m2, lat0, lon0 = make_coverage_geometry_area(pts, implement_width_m)
+        run_distance_m = compute_operation_path_distance_m(g)
+        area_m2 = run_distance_m * working_width_m
         area_gunthas = area_m2 / GUNTHA_M2
-
-        if area_gunthas < min_field_gunthas:
-            continue
 
         start_dt = g["Timestamp"].min()
         end_dt = g["Timestamp"].max()
-        work_time_min = (end_dt - start_dt).total_seconds() / 60.0
+        duration_min = (end_dt - start_dt).total_seconds() / 60.0
 
-        center_lat, center_lng = representative_center(pts)
+        center_lat = g["lat"].median()
+        center_lng = g["lng"].median()
 
         rows.append({
-            "Field ID": int(field_id),
-            "Area (Gunthas)": area_gunthas,
+            "Field ID": int(fid),
+            "Operation Points": int(len(g)),
+            "Run Distance (m)": run_distance_m,
+            "Working Width (m)": working_width_m,
             "Area (m²)": area_m2,
-            "Work Time (min)": work_time_min,
+            "Area (Gunthas)": area_gunthas,
             "Start Date": start_dt,
             "End Date": end_dt,
-            "Point Count": int(len(g)),
+            "Operation Time (min)": duration_min,
             "Center Lat": center_lat,
             "Center Lng": center_lng
         })
 
-        field_geom_info[int(field_id)] = {
-            "geom": geom,
-            "lat0": lat0,
-            "lon0": lon0,
-            "points": g.copy()
-        }
-
-    if not rows:
-        return pd.DataFrame(), {}
-
     summary = pd.DataFrame(rows).sort_values("Start Date").reset_index(drop=True)
 
-    # Inter-field gap stats
-    gap_distances_km = []
-    gap_times_min = []
-
+    # movement gap stats to next field
+    movement_rows = []
     for i in range(len(summary)):
         if i == len(summary) - 1:
-            gap_distances_km.append(np.nan)
-            gap_times_min.append(np.nan)
+            movement_rows.append((np.nan, np.nan))
             continue
 
-        fid_now = int(summary.loc[i, "Field ID"])
-        fid_next = int(summary.loc[i + 1, "Field ID"])
+        fid_now = summary.loc[i, "Field ID"]
+        fid_next = summary.loc[i + 1, "Field ID"]
 
-        g1 = field_geom_info[fid_now]["points"]
-        g2 = field_geom_info[fid_next]["points"]
+        g_now = op[op["field_id"] == fid_now].sort_values("Timestamp").reset_index(drop=True)
+        g_next = op[op["field_id"] == fid_next].sort_values("Timestamp").reset_index(drop=True)
 
-        p1 = g1[["lat", "lng"]].iloc[-1]
-        p2 = g2[["lat", "lng"]].iloc[0]
+        idx1 = g_now.index[-1]
+        idx2 = g_next.index[0]
 
-        dist_m = haversine_m(p1["lat"], p1["lng"], p2["lat"], p2["lng"])
-        gap_min = (
+        # straight gap between end and next start
+        d = haversine_m(
+            g_now.loc[len(g_now) - 1, "lat"], g_now.loc[len(g_now) - 1, "lng"],
+            g_next.loc[0, "lat"], g_next.loc[0, "lng"]
+        ) / 1000.0
+
+        t = (
             summary.loc[i + 1, "Start Date"] - summary.loc[i, "End Date"]
         ).total_seconds() / 60.0
+        movement_rows.append((d, max(t, 0.0)))
 
-        gap_times_min.append(max(gap_min, 0.0))
-        gap_distances_km.append(dist_m / 1000.0)
+    summary["Gap to Next Field (km)"] = [x[0] for x in movement_rows]
+    summary["Gap to Next Field (min)"] = [x[1] for x in movement_rows]
 
-    summary["Next Field Gap Distance (km)"] = gap_distances_km
-    summary["Next Field Gap Time (min)"] = gap_times_min
-
-    return summary, field_geom_info
+    return summary
 
 
-def build_map(df_all, summary, field_geom_info):
-    """
-    Create folium map with:
-    - raw points
-    - field path
-    - coverage polygons
-    - center markers
-    """
-    center = [df_all["lat"].mean(), df_all["lng"].mean()]
-    m = folium.Map(location=center, zoom_start=16, control_scale=True)
+# =========================================================
+# MAP
+# =========================================================
+def add_esri_satellite(base_map):
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="Satellite",
+        overlay=False,
+        control=True
+    ).add_to(base_map)
+
+
+def build_map(df, summary, show_raw_track=True, show_movement=True, show_operation=True, show_field_lines=True, show_centers=True):
+    center = [df["lat"].mean(), df["lng"].mean()]
+    m = folium.Map(location=center, zoom_start=17, control_scale=True, tiles=None)
+
+    add_esri_satellite(m)
     plugins.Fullscreen().add_to(m)
 
-    # Raw points
-    raw_layer = folium.FeatureGroup(name="Raw GPS Points", show=False)
-    for _, row in df_all.iterrows():
-        color = "blue" if row["field_id"] != -1 else "red"
-        folium.CircleMarker(
-            location=(row["lat"], row["lng"]),
-            radius=2,
-            color=color,
-            fill=True,
-            fill_opacity=0.7,
-            opacity=0.8
-        ).add_to(raw_layer)
-    raw_layer.add_to(m)
-
-    # Fields
-    palette = [
-        "blue", "green", "purple", "orange", "darkred",
-        "cadetblue", "darkgreen", "darkblue", "pink", "gray"
-    ]
-
-    for i, row in summary.iterrows():
-        fid = int(row["Field ID"])
-        color = palette[i % len(palette)]
-
-        info = field_geom_info[fid]
-        g = info["points"].sort_values("Timestamp").reset_index(drop=True)
-
-        # Path line
+    if show_raw_track:
+        fg_track = folium.FeatureGroup(name="Raw Track", show=True)
         folium.PolyLine(
-            locations=g[["lat", "lng"]].values.tolist(),
-            color=color,
-            weight=3,
-            opacity=0.9,
-            tooltip=(
-                f"Field {fid} | "
-                f"Area: {row['Area (Gunthas)']:.2f} gunthas | "
-                f"Time: {row['Work Time (min)']:.1f} min"
-            )
-        ).add_to(m)
+            locations=df[["lat", "lng"]].values.tolist(),
+            color="white",
+            weight=2,
+            opacity=0.7
+        ).add_to(fg_track)
+        fg_track.add_to(m)
 
-        # Coverage polygon
-        gj = geom_to_folium_geojson(info["geom"], info["lat0"], info["lon0"])
-        if gj is not None:
-            folium.GeoJson(
-                gj,
-                style_function=lambda _, c=color: {
-                    "fillColor": c,
-                    "color": c,
-                    "weight": 2,
-                    "fillOpacity": 0.18
-                },
+    if show_movement:
+        fg_move = folium.FeatureGroup(name="Movement Points", show=True)
+        move = df[df["point_type"] == "movement"]
+        for _, row in move.iterrows():
+            folium.CircleMarker(
+                location=(row["lat"], row["lng"]),
+                radius=3,
+                color="red",
+                fill=True,
+                fill_color="red",
+                fill_opacity=0.85,
+                opacity=0.9,
+                tooltip=f"Movement | neighbors={int(row['neighbor_count'])}"
+            ).add_to(fg_move)
+        fg_move.add_to(m)
+
+    if show_operation:
+        fg_op = folium.FeatureGroup(name="Operation Points", show=True)
+        op = df[df["point_type"] == "operation"]
+        for _, row in op.iterrows():
+            fid_txt = f" | field={int(row['field_id'])}" if pd.notna(row["field_id"]) else ""
+            folium.CircleMarker(
+                location=(row["lat"], row["lng"]),
+                radius=3,
+                color="lime",
+                fill=True,
+                fill_color="lime",
+                fill_opacity=0.85,
+                opacity=0.9,
+                tooltip=f"Operation | neighbors={int(row['neighbor_count'])}{fid_txt}"
+            ).add_to(fg_op)
+        fg_op.add_to(m)
+
+    if show_field_lines and not summary.empty:
+        fg_fields = folium.FeatureGroup(name="Field Operation Runs", show=True)
+        palette = ["cyan", "yellow", "magenta", "orange", "deepskyblue", "lawngreen", "violet", "gold"]
+
+        for i, row in summary.iterrows():
+            fid = row["Field ID"]
+            color = palette[i % len(palette)]
+            g = df[df["field_id"] == fid].sort_values("Timestamp")
+
+            folium.PolyLine(
+                locations=g[["lat", "lng"]].values.tolist(),
+                color=color,
+                weight=4,
+                opacity=0.9,
                 tooltip=(
-                    f"Field {fid} | "
-                    f"Area: {row['Area (Gunthas)']:.2f} gunthas"
+                    f"Field {int(fid)} | "
+                    f"Area={row['Area (Gunthas)']:.2f} gunthas | "
+                    f"Run={row['Run Distance (m)']:.1f} m"
                 )
-            ).add_to(m)
+            ).add_to(fg_fields)
 
-        # Center marker
-        folium.Marker(
-            location=(row["Center Lat"], row["Center Lng"]),
-            tooltip=(
-                f"Field {fid}\n"
-                f"Area: {row['Area (Gunthas)']:.2f} gunthas\n"
-                f"Points: {int(row['Point Count'])}"
-            ),
-            icon=folium.Icon(color="green", icon="info-sign")
-        ).add_to(m)
+        fg_fields.add_to(m)
 
-    folium.LayerControl().add_to(m)
+    if show_centers and not summary.empty:
+        fg_centers = folium.FeatureGroup(name="Field Centers", show=True)
+        for _, row in summary.iterrows():
+            folium.Marker(
+                location=(row["Center Lat"], row["Center Lng"]),
+                tooltip=(
+                    f"Field {int(row['Field ID'])}\n"
+                    f"Area: {row['Area (Gunthas)']:.2f} gunthas\n"
+                    f"Run Distance: {row['Run Distance (m)']:.1f} m\n"
+                    f"Operation Points: {int(row['Operation Points'])}"
+                ),
+                icon=folium.Icon(color="blue", icon="info-sign")
+            ).add_to(fg_centers)
+        fg_centers.add_to(m)
+
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
-def load_input_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx"):
-        return pd.read_excel(uploaded_file)
-    raise ValueError("Unsupported file type. Upload CSV or XLSX.")
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+def process_pipeline(
+    raw_df,
+    working_width_m,
+    density_radius_m,
+    min_neighbors,
+    min_operation_run_points,
+    min_movement_run_points,
+    min_movement_break_distance_m,
+    min_operation_segment_points,
+    max_speed_kmph
+):
+    df, meta = normalize_columns(raw_df)
+    df = remove_duplicate_points(df)
+    df = remove_speed_outliers(df, max_speed_kmph=max_speed_kmph)
+
+    if df.empty:
+        raise ValueError("No valid data left after cleaning.")
+
+    df = label_operation_by_density(
+        df,
+        radius_m=density_radius_m,
+        min_neighbors=min_neighbors
+    )
+
+    df = smooth_point_types(
+        df,
+        min_operation_run_points=min_operation_run_points,
+        min_movement_run_points=min_movement_run_points,
+        min_movement_break_distance_m=min_movement_break_distance_m
+    )
+
+    df = assign_field_ids(
+        df,
+        min_operation_segment_points=min_operation_segment_points
+    )
+
+    summary = compute_summary(df, working_width_m=working_width_m)
+
+    return df, summary, meta
 
 
 # =========================================================
 # STREAMLIT UI
 # =========================================================
-st.set_page_config(page_title="Field Coverage Area Calculator", layout="wide")
-st.title("Field Coverage Area Calculator from GPS")
-
-st.markdown(
-    """
-This version estimates **covered area** from the machine path using **implement width**,
-instead of using a convex hull.
-"""
-)
+st.set_page_config(page_title="Guntha Area Calculator - Movement vs Operation", layout="wide")
+st.title("GPS Guntha Area Calculator")
+st.caption("Logic: classify movement vs operation points first, then compute area as operation run distance × working width.")
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("Core Settings")
 
-    implement_width_m = st.number_input(
-        "Implement / Working Width (meters)",
-        min_value=0.2,
-        max_value=10.0,
-        value=1.20,
-        step=0.05
-    )
+    width_mode = st.radio("Working Width Input", ["Feet", "Meters"], index=0)
+    if width_mode == "Feet":
+        working_width_ft = st.number_input("Working Width (ft)", min_value=0.5, max_value=30.0, value=4.0, step=0.1)
+        working_width_m = working_width_ft * FT_TO_M
+    else:
+        working_width_m = st.number_input("Working Width (m)", min_value=0.1, max_value=20.0, value=1.2192, step=0.05)
 
-    dbscan_eps_m = st.number_input(
-        "DBSCAN eps (meters)",
-        min_value=1.0,
-        max_value=50.0,
-        value=10.0,
-        step=1.0
-    )
+    density_radius_m = st.number_input("Nearby Radius Y (meters)", min_value=1.0, max_value=50.0, value=8.0, step=1.0)
+    min_neighbors = st.number_input("Min Nearby Points N", min_value=1, max_value=100, value=8, step=1)
 
-    min_samples = st.number_input(
-        "DBSCAN min samples",
-        min_value=2,
-        max_value=100,
-        value=8,
-        step=1
-    )
+    st.header("Smoothing / Sequence Rules")
+    min_operation_run_points = st.number_input("Min operation run points", min_value=1, max_value=1000, value=15, step=1)
+    min_movement_run_points = st.number_input("Min movement run points", min_value=1, max_value=1000, value=5, step=1)
+    min_movement_break_distance_m = st.number_input("Min movement distance to split fields (m)", min_value=1.0, max_value=1000.0, value=20.0, step=1.0)
+    min_operation_segment_points = st.number_input("Min final field points", min_value=1, max_value=5000, value=20, step=1)
 
-    time_gap_minutes = st.number_input(
-        "New session gap (minutes)",
-        min_value=1,
-        max_value=240,
-        value=10,
-        step=1
-    )
+    st.header("Cleaning")
+    max_speed_kmph = st.number_input("Max allowed speed (kmph)", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
 
-    max_speed_kmph = st.number_input(
-        "Max allowed speed for GPS outlier removal (kmph)",
-        min_value=1.0,
-        max_value=60.0,
-        value=15.0,
-        step=1.0
-    )
+    st.header("Map Overlays")
+    show_raw_track = st.checkbox("Show raw track", value=True)
+    show_movement = st.checkbox("Show movement points", value=True)
+    show_operation = st.checkbox("Show operation points", value=True)
+    show_field_lines = st.checkbox("Show field operation runs", value=True)
+    show_centers = st.checkbox("Show field centers", value=True)
 
-    min_field_gunthas = st.number_input(
-        "Minimum field area to keep (Gunthas)",
-        min_value=0.0,
-        max_value=1000.0,
-        value=5.0,
-        step=0.5
-    )
-
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
     try:
         raw_df = load_input_file(uploaded_file)
 
-        df, synthetic_time, lat_col, lon_col, time_col = normalize_columns(raw_df)
-        df = remove_basic_gps_noise(df)
-        df = remove_speed_outliers(df, max_speed_kmph=max_speed_kmph)
-
-        if df.empty:
-            st.error("No valid GPS data left after cleaning.")
-            st.stop()
-
-        df = assign_sessions(df, time_gap_minutes=time_gap_minutes)
-        df = cluster_fields(df, dbscan_eps_m=dbscan_eps_m, min_samples=int(min_samples))
-
-        clustered = df[df["field_id"] != -1].copy()
-        if clustered.empty:
-            st.error("No valid field clusters detected. Try increasing DBSCAN eps or lowering min_samples.")
-            st.stop()
-
-        summary, field_geom_info = build_field_summary(
-            clustered,
-            implement_width_m=implement_width_m,
-            min_field_gunthas=min_field_gunthas
+        df, summary, meta = process_pipeline(
+            raw_df=raw_df,
+            working_width_m=working_width_m,
+            density_radius_m=density_radius_m,
+            min_neighbors=int(min_neighbors),
+            min_operation_run_points=int(min_operation_run_points),
+            min_movement_run_points=int(min_movement_run_points),
+            min_movement_break_distance_m=min_movement_break_distance_m,
+            min_operation_segment_points=int(min_operation_segment_points),
+            max_speed_kmph=max_speed_kmph
         )
 
+        c1, c2, c3, c4 = st.columns(4)
+        c1.info(f"Lat col: **{meta['lat_col']}**")
+        c2.info(f"Lng col: **{meta['lon_col']}**")
+        c3.info(f"Time col: **{meta['time_col'] if meta['time_col'] else 'Synthetic'}**")
+        c4.info(f"Rows used: **{len(df)}**")
+
+        if meta["synthetic_time"]:
+            st.warning("No time column found. Synthetic timestamps were created. Area logic is still okay, but time metrics are artificial.")
+
+        map_obj = build_map(
+            df=df,
+            summary=summary,
+            show_raw_track=show_raw_track,
+            show_movement=show_movement,
+            show_operation=show_operation,
+            show_field_lines=show_field_lines,
+            show_centers=show_centers
+        )
+
+        st.subheader("Satellite Map")
+        folium_static(map_obj, width=1500, height=750)
+
+        movement_count = int((df["point_type"] == "movement").sum())
+        operation_count = int((df["point_type"] == "operation").sum())
+        total_area_guntha = summary["Area (Gunthas)"].sum() if not summary.empty else 0.0
+        total_area_m2 = summary["Area (m²)"].sum() if not summary.empty else 0.0
+        total_run_m = summary["Run Distance (m)"].sum() if not summary.empty else 0.0
+
+        st.subheader("Totals")
+        t1, t2, t3, t4, t5 = st.columns(5)
+        t1.metric("Movement Points", movement_count)
+        t2.metric("Operation Points", operation_count)
+        t3.metric("Total Run Distance", f"{total_run_m:.2f} m")
+        t4.metric("Total Area", f"{total_area_m2:.2f} m²")
+        t5.metric("Total Area", f"{total_area_guntha:.2f} Gunthas")
+
+        st.subheader("Field Summary")
         if summary.empty:
-            st.error("No fields remain after minimum area filter. Reduce the minimum field area or adjust clustering.")
-            st.stop()
+            st.warning("No final operation field clusters detected. Tune radius / min neighbors / smoothing values.")
+        else:
+            display_df = summary.copy()
+            numeric_cols = [
+                "Run Distance (m)", "Working Width (m)", "Area (m²)",
+                "Area (Gunthas)", "Operation Time (min)",
+                "Gap to Next Field (km)", "Gap to Next Field (min)"
+            ]
+            for col in numeric_cols:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].round(2)
 
-        map_obj = build_map(df, summary, field_geom_info)
+            st.dataframe(display_df, use_container_width=True)
 
-        total_area_gunthas = summary["Area (Gunthas)"].sum()
-        total_area_m2 = summary["Area (m²)"].sum()
-        total_work_time = summary["Work Time (min)"].sum()
-        total_gap_dist = np.nansum(summary["Next Field Gap Distance (km)"])
-        total_gap_time = np.nansum(summary["Next Field Gap Time (min)"])
-
-        # Header info
-        cinfo1, cinfo2, cinfo3, cinfo4 = st.columns(4)
-        cinfo1.info(f"Detected lat column: **{lat_col}**")
-        cinfo2.info(f"Detected lon column: **{lon_col}**")
-        cinfo3.info(f"Detected time column: **{time_col if time_col else 'Synthetic'}**")
-        cinfo4.info(f"Rows after cleaning: **{len(df)}**")
-
-        if synthetic_time:
-            st.warning(
-                "No timestamp column was found, so synthetic timestamps were created. "
-                "Area is still usable, but time-based metrics are artificial."
+            st.download_button(
+                "Download Summary CSV",
+                data=display_df.to_csv(index=False).encode("utf-8"),
+                file_name="guntha_area_summary.csv",
+                mime="text/csv"
             )
 
-        st.subheader("Map")
-        folium_static(map_obj, width=1500, height=700)
-
-        st.subheader("Summary")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Area", f"{total_area_gunthas:.2f} Gunthas")
-        c2.metric("Total Area", f"{total_area_m2:.2f} m²")
-        c3.metric("Total Work Time", f"{total_work_time:.2f} min")
-        c4.metric("Inter-field Gap Distance", f"{total_gap_dist:.2f} km")
-        c5.metric("Inter-field Gap Time", f"{total_gap_time:.2f} min")
-
-        display_df = summary.copy()
-        for col in ["Area (Gunthas)", "Area (m²)", "Work Time (min)", "Next Field Gap Distance (km)", "Next Field Gap Time (min)"]:
-            display_df[col] = display_df[col].round(2)
-
-        st.dataframe(display_df, use_container_width=True)
-
-        csv_bytes = display_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Summary CSV",
-            data=csv_bytes,
-            file_name="field_coverage_summary.csv",
-            mime="text/csv"
-        )
-
-        with st.expander("Show cleaned input data"):
-            st.dataframe(df, use_container_width=True)
+        with st.expander("Show classified point data"):
+            view_df = df.copy()
+            if "field_id" in view_df.columns:
+                view_df["field_id"] = view_df["field_id"].astype("Int64")
+            st.dataframe(view_df, use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {e}")
